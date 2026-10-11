@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useActionState, useEffect, useMemo, useState, useTransition } from 'react';
 import { Plus } from 'lucide-react';
-import { claimLead, deleteLead, moveLead, requestClose, saveLead, startTrial } from '@/app/crm/actions';
+import { claimLead, confirmSaleFromLead, deleteLead, moveLead, requestClose, saveLead, startTrial } from '@/app/crm/actions';
 import { brl, dateBR, SEGMENTS, segmentLabel, UFS } from '@/lib/format';
 import { LEAD_STAGES, TRIAL_STATUSES, trialLabel, type LeadCard, type LeadStage } from '@/lib/leads';
 import type { SaveState } from '@/lib/types';
@@ -153,18 +153,38 @@ function RequestCloseButton({ lead, onDone }: { lead: LeadCard; onDone: (l: Lead
   );
 }
 
+export type KanbanService = {
+  id: string;
+  name: string;
+  price: number;
+  commission_type: 'percent' | 'fixed';
+  commission_percent: number;
+  commission_fixed: number;
+};
+
+export type KanbanPartnerDetail = {
+  id: string;
+  name: string;
+  pix_key: string | null;
+  pix_key_type: string | null;
+};
+
 export function KanbanBoard({
   leads: initial,
   today,
   mode,
   partnerOptions,
   currentPartnerId,
+  services,
+  partnerDetails,
 }: {
   leads: LeadCard[];
   today: string;
   mode: 'partner' | 'admin';
   partnerOptions?: { value: string; label: string }[];
   currentPartnerId?: string;
+  services?: KanbanService[];
+  partnerDetails?: Record<string, KanbanPartnerDetail>;
 }) {
   const [leads, setLeads] = useState(initial);
   useEffect(() => setLeads(initial), [initial]);
@@ -172,8 +192,10 @@ export function KanbanBoard({
   const [dragId, setDragId] = useState<string | null>(null);
   const [overStage, setOverStage] = useState<string | null>(null);
   const [editing, setEditing] = useState<LeadCard | 'new' | null>(null);
+  const [closingLead, setClosingLead] = useState<LeadCard | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [, startTransition] = useTransition();
+
 
   // Leads disponíveis (não são do parceiro atual, estão no pool)
   const availableLeads = useMemo(
@@ -324,6 +346,11 @@ export function KanbanBoard({
                       )}
                       {mode === 'admin' && l.partner_name && <span className="badge">{l.partner_name}</span>}
                       <TrialBadge lead={l} />
+                      {l.close_requested_at && l.stage !== 'won' && !l.sale_id && (
+                        <span className="badge badge-warn" style={{ fontWeight: 600 }}>
+                          🔔 Fechamento solicitado
+                        </span>
+                      )}
                     </div>
                     {l.next_action && open && <p className="k-next">{l.next_action}</p>}
 
@@ -346,6 +373,18 @@ export function KanbanBoard({
                       <TrialButton lead={l} onDone={updateLead} />
                     )}
 
+                    {/* Admin: Confirmar fechamento solicitado pelo afiliado ou a qualquer momento */}
+                    {mode === 'admin' && l.stage !== 'won' && !l.sale_id && (
+                      <button
+                        type="button"
+                        className={`btn btn-sm ${l.close_requested_at ? 'btn-good' : ''}`}
+                        style={{ width: '100%', marginTop: 6, fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                        onClick={() => setClosingLead(l)}
+                      >
+                        {l.close_requested_at ? '🔔 Confirmar Fechamento' : 'Fechar Venda (Admin)'}
+                      </button>
+                    )}
+
                     {/* Parceiro: solicitar fechamento nas etapas finais */}
                     {mode === 'partner' && (l.stage === 'negotiation' || l.stage === 'proposal') && !l.sale_id && (
                       <RequestCloseButton lead={l} onDone={updateLead} />
@@ -366,6 +405,15 @@ export function KanbanBoard({
       </div>
 
       {editing && <LeadModal lead={editing === 'new' ? null : editing} onClose={() => setEditing(null)} mode={mode} partnerOptions={partnerOptions} />}
+      {closingLead && services && services.length > 0 && (
+        <ConfirmSaleModal
+          lead={closingLead}
+          services={services}
+          partnerDetail={closingLead.partner_id ? partnerDetails?.[closingLead.partner_id] : null}
+          today={today}
+          onClose={() => setClosingLead(null)}
+        />
+      )}
     </>
   );
 }
@@ -458,3 +506,168 @@ function LeadModal({
     </div>
   );
 }
+
+function ConfirmSaleModal({
+  lead,
+  services,
+  partnerDetail,
+  today,
+  onClose,
+}: {
+  lead: LeadCard;
+  services: KanbanService[];
+  partnerDetail?: KanbanPartnerDetail | null;
+  today: string;
+  onClose: () => void;
+}) {
+  const [selectedServiceId, setSelectedServiceId] = useState(services[0]?.id ?? '');
+  const [pending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+
+  const selectedService = services.find((s) => s.id === selectedServiceId) ?? services[0];
+  const commAmount = selectedService
+    ? selectedService.commission_type === 'percent'
+      ? Math.round((selectedService.price * selectedService.commission_percent)) / 100
+      : Math.min(selectedService.commission_fixed, selectedService.price)
+    : 0;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    setError(null);
+    startTransition(async () => {
+      const res = await confirmSaleFromLead(formData);
+      if (res?.error) {
+        setError(res.error);
+      } else {
+        onClose();
+      }
+    });
+  }
+
+  return (
+    <div className="modal-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label="Confirmar Fechamento de Venda">
+        <h2>Confirmar Fechamento de Venda</h2>
+        <p className="muted" style={{ marginTop: -8, marginBottom: 16 }}>
+          Validação exclusiva do administrador. Ao confirmar, o lead é marcado como Fechado, a venda é registrada e a comissão do afiliado é gerada.
+        </p>
+
+        <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 8, padding: 12, marginBottom: 16 }}>
+          <p style={{ margin: '0 0 6px 0', fontSize: 13 }}>
+            <strong>Lead / Estabelecimento:</strong> {lead.name}
+          </p>
+          <p style={{ margin: '0 0 6px 0', fontSize: 13 }}>
+            <strong>Afiliado responsável:</strong> {lead.partner_name || partnerDetail?.name || 'Não identificado'}
+          </p>
+          <p style={{ margin: 0, fontSize: 13 }}>
+            <strong>Chave Pix do afiliado:</strong>{' '}
+            {partnerDetail?.pix_key ? (
+              <span style={{ color: 'var(--good, #10b981)', fontWeight: 600 }}>
+                {partnerDetail.pix_key_type ? `[${partnerDetail.pix_key_type.toUpperCase()}] ` : ''}
+                {partnerDetail.pix_key}
+              </span>
+            ) : (
+              <span style={{ color: 'var(--bad, #ef4444)', fontWeight: 600 }}>
+                ⚠️ Não cadastrada pelo afiliado ainda
+              </span>
+            )}
+          </p>
+        </div>
+
+        <form onSubmit={handleSubmit} noValidate>
+          <input type="hidden" name="lead_id" value={lead.id} />
+          <div className="form-grid">
+            <label className="field full">
+              <span>Produto / Plano</span>
+              <select
+                name="service_id"
+                value={selectedServiceId}
+                onChange={(e) => setSelectedServiceId(e.target.value)}
+                required
+              >
+                {services.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} — {brl(s.price)}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {selectedService && (
+              <div
+                className="field full"
+                style={{
+                  fontSize: 13,
+                  background: 'rgba(16, 185, 129, 0.08)',
+                  padding: 10,
+                  borderRadius: 6,
+                  border: '1px solid rgba(16, 185, 129, 0.2)',
+                }}
+              >
+                <span>
+                  💰 Valor da venda: <strong>{brl(selectedService.price)}</strong>
+                </span>
+                <span style={{ marginLeft: 16 }}>
+                  🎁 Comissão do afiliado:{' '}
+                  <strong>
+                    {brl(commAmount)} ({selectedService.commission_type === 'percent' ? `${selectedService.commission_percent}%` : 'Fixa'})
+                  </strong>
+                </span>
+              </div>
+            )}
+
+            <label className="field">
+              <span>Forma de pagamento</span>
+              <select name="payment_method" defaultValue="pix">
+                <option value="pix">Pix</option>
+                <option value="credit_card">Cartão de Crédito</option>
+                <option value="boleto">Boleto Bancário</option>
+                <option value="bank_transfer">Transferência Bancária</option>
+                <option value="cash">Dinheiro</option>
+                <option value="other">Outro</option>
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Data da venda</span>
+              <input name="sold_at" type="date" defaultValue={today} required />
+            </label>
+
+            <label className="field full">
+              <span>Observações (opcional)</span>
+              <textarea
+                name="notes"
+                placeholder="Ex.: Pagamento confirmado via Pix. Liberar acesso ao Gestão Pro."
+                maxLength={500}
+                rows={2}
+              />
+            </label>
+          </div>
+
+          {error && (
+            <p className="flash flash-bad" role="alert" style={{ marginTop: 16, marginBottom: 0 }}>
+              {error}
+            </p>
+          )}
+
+          <div className="form-actions" style={{ marginTop: 20 }}>
+            <button className="btn btn-good" type="submit" disabled={pending}>
+              {pending ? 'Confirmando…' : '✓ Confirmar Venda e Liberar Comissão'}
+            </button>
+            <button className="btn btn-ghost" type="button" onClick={onClose} disabled={pending}>
+              Cancelar
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+

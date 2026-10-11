@@ -246,3 +246,110 @@ export async function setDistributionMode(mode: 'manual' | 'auto'): Promise<{ er
   refresh();
   return null;
 }
+
+/** Admin valida e confirma o fechamento da venda do lead */
+export async function confirmSaleFromLead(formData: FormData): Promise<{ error?: string; ok?: boolean }> {
+  await requireProfile('super_admin');
+  const leadId = str(formData, 'lead_id');
+  const serviceId = str(formData, 'service_id');
+  const paymentMethod = str(formData, 'payment_method');
+  const soldAt = str(formData, 'sold_at');
+  const notes = str(formData, 'notes');
+
+  if (!isUuid(leadId) || !isUuid(serviceId)) return { error: 'Dados inválidos.' };
+
+  const supabase = await createClient();
+
+  // 1. Obter dados do lead
+  const { data: lead, error: lErr } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('id', leadId)
+    .single();
+  if (lErr || !lead) return { error: 'Lead não encontrado.' };
+
+  if (!lead.partner_id) {
+    return { error: 'O lead precisa estar atribuído a um parceiro para confirmar a venda.' };
+  }
+
+  // 2. Obter serviço
+  const { data: svc, error: sErr } = await supabase
+    .from('services')
+    .select('*')
+    .eq('id', serviceId)
+    .single();
+  if (sErr || !svc || !svc.active) return { error: 'Serviço inválido ou inativo.' };
+
+  // 3. Garantir ou criar estabelecimento do parceiro
+  const { createAdminClient } = await import('@/lib/supabase/admin');
+  let admin: ReturnType<typeof createAdminClient>;
+  try { admin = createAdminClient(); } catch { return { error: 'Serviço administrativo indisponível.' }; }
+
+  const { data: existingEst } = await admin
+    .from('establishments')
+    .select('id, name, city')
+    .eq('partner_id', lead.partner_id);
+
+  const norm = (s: string | null) => (s ?? '').trim().toLowerCase();
+  const foundEst = (existingEst ?? []).find(
+    (e) => norm(e.name) === norm(lead.name) && norm(e.city) === norm(lead.city)
+  );
+
+  let establishmentId: string;
+  if (foundEst) {
+    establishmentId = foundEst.id;
+  } else {
+    const { data: newEst, error: estErr } = await admin
+      .from('establishments')
+      .insert({
+        partner_id: lead.partner_id,
+        name: lead.name,
+        responsible_name: lead.contact_name || lead.name,
+        whatsapp: lead.whatsapp || '',
+        email: lead.email || '',
+        city: lead.city || '',
+        state: lead.state || '',
+        segment: lead.segment || 'outro',
+      })
+      .select('id')
+      .single();
+    if (estErr || !newEst) return { error: friendly(estErr) };
+    establishmentId = newEst.id;
+  }
+
+  // 4. Criar venda (trigger sales_sync_commission calcula e cria a comissão automaticamente)
+  const saleDate = /^\d{4}-\d{2}-\d{2}$/.test(soldAt) ? soldAt : new Date().toISOString().slice(0, 10);
+  const { data: sale, error: saleError } = await admin
+    .from('sales')
+    .insert({
+      partner_id: lead.partner_id,
+      establishment_id: establishmentId,
+      service_id: svc.id,
+      amount: svc.price,
+      sold_at: saleDate,
+      payment_method: paymentMethod || 'pix',
+      status: 'paid', // Venda validada pelo admin
+      notes: notes || `Fechamento validado pelo admin a partir do lead CRM (${lead.name})`,
+    })
+    .select('id')
+    .single();
+
+  if (saleError || !sale) return { error: friendly(saleError) };
+
+  // 5. Atualizar lead para Fechado (won) e vincular a venda
+  const { error: leadUpdateErr } = await admin
+    .from('leads')
+    .update({
+      stage: 'won',
+      sale_id: sale.id,
+      stage_changed_at: new Date().toISOString(),
+      opportunity_value: svc.price,
+    })
+    .eq('id', leadId);
+
+  if (leadUpdateErr) return { error: friendly(leadUpdateErr) };
+
+  refresh();
+  return { ok: true };
+}
+

@@ -1,10 +1,10 @@
-import { KanbanBoard } from '@/components/kanban-board';
+import { KanbanBoard, type KanbanPartnerDetail, type KanbanService } from '@/components/kanban-board';
 import { DistributionToggle } from '@/components/distribution-toggle';
 import { FilterBar, PageHeader, SelectFilter, Stats } from '@/components/ui';
 import { requireProfile } from '@/lib/auth';
 import { brl, isUuid } from '@/lib/format';
 import { LEAD_COLUMNS, leadStats, type LeadCard } from '@/lib/leads';
-import { partnerNames } from '@/lib/partners';
+import { partnerDetails, partnerNames } from '@/lib/partners';
 import { todaySP } from '@/lib/period';
 import { createClient } from '@/lib/supabase/server';
 
@@ -23,6 +23,29 @@ export default async function AdminCrm({ searchParams }: { searchParams: Promise
     .eq('key', 'lead_distribution_mode')
     .single();
   const distributionMode = (setting?.value ?? 'manual') as 'manual' | 'auto';
+
+  // Serviços ativos para confirmação de venda
+  const { data: servicesData } = await supabase
+    .from('services')
+    .select('id, name, price, commission_type, commission_percent, commission_fixed')
+    .eq('active', true)
+    .order('price');
+
+  const services: KanbanService[] = (servicesData ?? []).map((s) => ({
+    id: s.id,
+    name: s.name,
+    price: Number(s.price),
+    commission_type: s.commission_type as 'percent' | 'fixed',
+    commission_percent: Number(s.commission_percent),
+    commission_fixed: Number(s.commission_fixed),
+  }));
+
+  // Detalhes dos parceiros com chaves Pix
+  const pMap = await partnerDetails(supabase);
+  const partnerDetailsRecord: Record<string, KanbanPartnerDetail> = {};
+  pMap.forEach((v, k) => {
+    partnerDetailsRecord[k] = v;
+  });
 
   let q = supabase
     .from('leads')
@@ -45,10 +68,37 @@ export default async function AdminCrm({ searchParams }: { searchParams: Promise
   const availableCount = leads.filter((l) => l.is_available).length;
   const assignedCount = leads.filter((l) => !l.is_available).length;
   const trialActive = leads.filter((l) => l.trial_status === 'active').length;
+  const closeRequestsCount = leads.filter(
+    (l) => l.close_requested_at && l.stage !== 'won' && !l.sale_id
+  ).length;
 
   return (
     <>
       <PageHeader eyebrow="CRM" title="Funil de todos os parceiros" description="Visão geral dos leads. Adicione leads, configure distribuição e gerencie o funil." />
+
+      {closeRequestsCount > 0 && (
+        <div
+          style={{
+            background: 'rgba(234, 179, 8, 0.12)',
+            border: '1px solid rgba(234, 179, 8, 0.4)',
+            borderRadius: 8,
+            padding: '12px 16px',
+            marginBottom: 16,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}
+        >
+          <div>
+            <strong style={{ color: '#eab308' }}>🔔 {closeRequestsCount} solicitação(ões) de confirmação de venda aguardando aprovação!</strong>
+            <p className="muted" style={{ margin: '3px 0 0', fontSize: 13 }}>
+              Os afiliados solicitaram validação para fechamento de venda. Localize o card com a tag <strong>"🔔 Fechamento solicitado"</strong> e clique em <strong>"Confirmar Fechamento"</strong> para aprovar a venda e liberar a comissão.
+            </p>
+          </div>
+        </div>
+      )}
+
       <FilterBar>
         <SelectFilter name="parceiro" label="Parceiro" value={sp.parceiro} options={partnerOptions} />
         <DistributionToggle mode={distributionMode} />
@@ -58,11 +108,25 @@ export default async function AdminCrm({ searchParams }: { searchParams: Promise
         items={[
           { label: 'Leads no funil', value: String(s.total - s.won - s.lost), hint: `${s.fresh} novo(s)` },
           { label: 'Disponíveis / Atribuídos', value: `${availableCount} / ${assignedCount}`, hint: 'Leads no pool vs com parceiro' },
+          {
+            label: 'Fechamentos solicitados',
+            value: String(closeRequestsCount),
+            hint: closeRequestsCount > 0 ? 'Aguardando sua validação' : 'Nenhuma pendência',
+            tone: closeRequestsCount > 0 ? 'bad' : undefined,
+          },
           { label: 'Testes ativos', value: String(trialActive), hint: 'Gestão Pro em período de teste', tone: trialActive > 0 ? 'warn' : undefined },
           { label: 'Follow-ups', value: `${s.followToday} hoje`, hint: s.overdue ? `${s.overdue} atrasado(s)` : 'Nenhum atrasado', tone: s.overdue ? 'bad' : undefined },
         ]}
       />
-      <KanbanBoard leads={leads} today={today} mode="admin" partnerOptions={partnerOptions} />
+      <KanbanBoard
+        leads={leads}
+        today={today}
+        mode="admin"
+        partnerOptions={partnerOptions}
+        services={services}
+        partnerDetails={partnerDetailsRecord}
+      />
     </>
   );
 }
+
