@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+.DS_Store
+
+# Segredos: nunca versionar
+.env
+.env.local
+.env.*.local
+
+.vercel
