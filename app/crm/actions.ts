@@ -353,3 +353,155 @@ export async function confirmSaleFromLead(formData: FormData): Promise<{ error?:
   return { ok: true };
 }
 
+export type LeadImportItem = {
+  name: string;
+  contact_name?: string | null;
+  whatsapp?: string | null;
+  email?: string | null;
+  city?: string | null;
+  state?: string | null;
+  segment?: string | null;
+  source?: string | null;
+  stage?: string | null;
+  opportunity_value?: number | null;
+  notes?: string | null;
+};
+
+export type ImportLeadsResult = {
+  successCount: number;
+  skippedDuplicates: number;
+  errors: string[];
+};
+
+export async function importLeads(
+  leads: LeadImportItem[],
+  assignTo: string // 'available' or partner UUID
+): Promise<{ ok?: boolean; error?: string; result?: ImportLeadsResult }> {
+  const profile = await requireProfile('super_admin');
+  if (profile.role !== 'super_admin') {
+    return { error: 'Apenas administradores podem importar planilhas.' };
+  }
+
+  if (!Array.isArray(leads) || leads.length === 0) {
+    return { error: 'Nenhum lead fornecido para importação.' };
+  }
+
+  const { createAdminClient } = await import('@/lib/supabase/admin');
+  let admin: ReturnType<typeof createAdminClient>;
+  try {
+    admin = createAdminClient();
+  } catch {
+    return { error: 'Serviço administrativo indisponível.' };
+  }
+
+  const makeAvailable = assignTo === 'available';
+  const partnerId = isUuid(assignTo) ? assignTo : null;
+
+  // Carregar todos os Whatsapps existentes para checar duplicidades
+  const { data: existingLeads } = await admin.from('leads').select('whatsapp').not('whatsapp', 'is', null);
+  const existingPhones = new Set<string>(
+    (existingLeads ?? []).map((l: { whatsapp: string | null }) => (l.whatsapp ? l.whatsapp.replace(/\D/g, '') : '')).filter(Boolean)
+  );
+
+  let successCount = 0;
+  let skippedDuplicates = 0;
+  const errors: string[] = [];
+  const rowsToInsert: any[] = [];
+  const processedInBatchPhones = new Set<string>();
+
+  for (let idx = 0; idx < leads.length; idx++) {
+    const item = leads[idx];
+    const rowNum = idx + 2; // Considerando linha 1 como cabeçalho
+
+    const name = (item.name ?? '').trim();
+    if (!name || name.length < 2) {
+      errors.push(`Linha ${rowNum}: Nome da empresa é obrigatório.`);
+      continue;
+    }
+
+    let phone = (item.whatsapp ?? '').replace(/\D/g, '');
+    if (phone) {
+      if (phone.length < 10 || phone.length > 13) {
+        errors.push(`Linha ${rowNum}: WhatsApp "${item.whatsapp}" inválido (precisa ter DDD).`);
+        continue;
+      }
+      if (existingPhones.has(phone) || processedInBatchPhones.has(phone)) {
+        skippedDuplicates++;
+        continue;
+      }
+      processedInBatchPhones.add(phone);
+    }
+
+    // Validação ou fallback de segmento
+    const rawSegment = (item.segment ?? '').trim().toLowerCase();
+    const validSegment = SEGMENTS.some((s) => s.value === rawSegment)
+      ? rawSegment
+      : SEGMENTS.some((s) => s.label.toLowerCase() === rawSegment)
+      ? SEGMENTS.find((s) => s.label.toLowerCase() === rawSegment)!.value
+      : 'outro';
+
+    // Validação ou fallback de estado
+    const rawState = (item.state ?? '').trim().toUpperCase();
+    const validState = UFS.includes(rawState) ? rawState : null;
+
+    // Etapa inicial
+    const rawStage = (item.stage ?? '').trim().toLowerCase();
+    const validStage = STAGE_KEYS.includes(rawStage) ? rawStage : 'new';
+
+    const row = {
+      name: name.slice(0, 120),
+      contact_name: item.contact_name ? item.contact_name.trim().slice(0, 120) : null,
+      whatsapp: phone || null,
+      email: item.email ? item.email.trim().slice(0, 200) : null,
+      city: item.city ? item.city.trim().slice(0, 100) : null,
+      state: validState,
+      segment: validSegment,
+      source: item.source ? item.source.trim().slice(0, 80) : 'Planilha',
+      stage: validStage,
+      opportunity_value: typeof item.opportunity_value === 'number' && item.opportunity_value >= 0 ? item.opportunity_value : null,
+      notes: item.notes ? item.notes.trim().slice(0, 2000) : null,
+      is_available: makeAvailable || !partnerId,
+      partner_id: partnerId,
+    };
+
+    rowsToInsert.push(row);
+  }
+
+  // Inserção em lotes de 100
+  const supabase = await createClient();
+  const createdIds: string[] = [];
+
+  for (let i = 0; i < rowsToInsert.length; i += 100) {
+    const chunk = rowsToInsert.slice(i, i + 100);
+    const { data: inserted, error: insertErr } = await admin.from('leads').insert(chunk).select('id');
+    if (insertErr) {
+      errors.push(`Erro ao salvar lote: ${insertErr.message}`);
+    } else if (inserted) {
+      successCount += inserted.length;
+      inserted.forEach((r: { id: string }) => createdIds.push(r.id));
+    }
+  }
+
+  // Se foram para a fila disponível, tenta distribuição automática se estiver ativo
+  if (makeAvailable && createdIds.length > 0) {
+    for (const leadId of createdIds) {
+      try {
+        await supabase.rpc('auto_distribute_lead', { p_lead_id: leadId });
+      } catch {
+        // Ignora erro de distribuição silenciosamente
+      }
+    }
+  }
+
+  refresh();
+
+  return {
+    ok: true,
+    result: {
+      successCount,
+      skippedDuplicates,
+      errors,
+    },
+  };
+}
+

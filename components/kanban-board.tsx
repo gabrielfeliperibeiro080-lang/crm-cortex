@@ -2,10 +2,11 @@
 
 import Link from 'next/link';
 import { useActionState, useEffect, useMemo, useState, useTransition } from 'react';
-import { Plus } from 'lucide-react';
+import { FileSpreadsheet, Plus } from 'lucide-react';
 import { claimLead, confirmSaleFromLead, deleteLead, moveLead, requestClose, saveLead, startTrial } from '@/app/crm/actions';
 import { brl, dateBR, SEGMENTS, segmentLabel, UFS } from '@/lib/format';
 import { LEAD_STAGES, TRIAL_STATUSES, trialLabel, type LeadCard, type LeadStage } from '@/lib/leads';
+import { LeadImportModal } from '@/components/lead-import-modal';
 import type { SaveState } from '@/lib/types';
 
 function waLink(number: string) {
@@ -193,6 +194,7 @@ export function KanbanBoard({
   const [overStage, setOverStage] = useState<string | null>(null);
   const [editing, setEditing] = useState<LeadCard | 'new' | null>(null);
   const [closingLead, setClosingLead] = useState<LeadCard | null>(null);
+  const [showImportModal, setShowImportModal] = useState<boolean>(false);
   const [message, setMessage] = useState<string | null>(null);
   const [, startTransition] = useTransition();
 
@@ -242,11 +244,21 @@ export function KanbanBoard({
     <>
       <div className="kanban-toolbar">
         <p className="muted" style={{ margin: 0 }}>Arraste os cards entre as colunas ou use o seletor "Mover para".</p>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {mode === 'admin' && (
-            <button className="btn" type="button" onClick={() => setEditing('new')}>
-              <Plus size={17} /> Adicionar lead
-            </button>
+            <>
+              <button
+                className="btn-ghost"
+                type="button"
+                onClick={() => setShowImportModal(true)}
+                style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+              >
+                <FileSpreadsheet size={16} /> Importar Planilha
+              </button>
+              <button className="btn" type="button" onClick={() => setEditing('new')}>
+                <Plus size={17} /> Adicionar lead
+              </button>
+            </>
           )}
           {mode === 'partner' && (
             <button className="btn" type="button" onClick={() => setEditing('new')}>
@@ -405,6 +417,12 @@ export function KanbanBoard({
       </div>
 
       {editing && <LeadModal lead={editing === 'new' ? null : editing} onClose={() => setEditing(null)} mode={mode} partnerOptions={partnerOptions} />}
+      {showImportModal && (
+        <LeadImportModal
+          onClose={() => setShowImportModal(false)}
+          partnerOptions={partnerOptions}
+        />
+      )}
       {closingLead && services && services.length > 0 && (
         <ConfirmSaleModal
           lead={closingLead}
